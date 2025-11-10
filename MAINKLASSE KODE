@@ -1,0 +1,190 @@
+/*******************************************************
+ * main.c — LEDs-only demo for 5 HLS IP cores (no UART)
+ * - Randomly injects an "intruder" every 3–4 loops
+ * - Uses sum >= 1900 as test condition
+ *******************************************************/
+#include "xparameters.h"
+#include "xstatus.h"
+#include "xgpio.h"
+#include "sleep.h"              // usleep()
+
+#include "xalarm_ip.h"
+#include "xsensor_rng.h"
+#include "xcam81_sum.h"
+#include "xthresh_compare.h"    // Set_value_r(), Set_thresh()
+#include "xmmult3x3.h"
+
+/* -------- Device IDs (match xparameters.h) -------- */
+#ifndef LEDS_GPIO_DEVICE_ID
+  #ifdef XPAR_AXI_GPIO_LEDS_DEVICE_ID
+    #define LEDS_GPIO_DEVICE_ID XPAR_AXI_GPIO_LEDS_DEVICE_ID
+  #elif defined(XPAR_AXI_GPIO_0_DEVICE_ID)
+    #define LEDS_GPIO_DEVICE_ID XPAR_AXI_GPIO_0_DEVICE_ID
+  #elif defined(XPAR_GPIO_0_DEVICE_ID)
+    #define LEDS_GPIO_DEVICE_ID XPAR_GPIO_0_DEVICE_ID
+  #else
+    #error "Set LEDS_GPIO_DEVICE_ID to your AXI GPIO instance ID"
+  #endif
+#endif
+#ifndef ALARM_IP_DEVICE_ID
+  #define ALARM_IP_DEVICE_ID     XPAR_ALARM_IP_0_DEVICE_ID
+#endif
+#ifndef SENSOR_RNG_DEVICE_ID
+  #define SENSOR_RNG_DEVICE_ID   XPAR_SENSOR_RNG_0_DEVICE_ID
+#endif
+#ifndef CAM81_SUM_DEVICE_ID
+  #define CAM81_SUM_DEVICE_ID    XPAR_CAM81_SUM_0_DEVICE_ID
+#endif
+#ifndef THRESH_CMP_DEVICE_ID
+  #define THRESH_CMP_DEVICE_ID   XPAR_THRESH_COMPARE_0_DEVICE_ID
+#endif
+#ifndef MMULT3X3_DEVICE_ID
+  #define MMULT3X3_DEVICE_ID     XPAR_MMULT3X3_0_DEVICE_ID
+#endif
+
+/* ---------------- Instances ---------------- */
+static XGpio           GpioLeds;
+static XAlarm_ip       IpAlarm;
+static XSensor_rng     IpSensor;
+static XCam81_sum      IpCam;
+static XThresh_compare IpThresh;
+static XMmult3x3       IpMmul;
+
+/* ---------------- Small helpers ---------------- */
+static void RunAndWait_alarm (XAlarm_ip *p){ XAlarm_ip_Start(p); while(!XAlarm_ip_IsDone(p)){} }
+static void RunAndWait_sensor(XSensor_rng *p){ XSensor_rng_Start(p); while(!XSensor_rng_IsDone(p)){} }
+static void RunAndWait_cam   (XCam81_sum *p){ XCam81_sum_Start(p); while(!XCam81_sum_IsDone(p)){} }
+static void RunAndWait_thresh(XThresh_compare *p){ XThresh_compare_Start(p); while(!XThresh_compare_IsDone(p)){} }
+static void RunAndWait_mmul  (XMmult3x3 *p){ XMmult3x3_Start(p); while(!XMmult3x3_IsDone(p)){} }
+
+static inline void decode_alarm_return(u32 ret, u8 *state, u8 *alarm_on, u16 *intr_sum){
+  *state=(u8)(ret&0x3u); *alarm_on=(u8)((ret>>2)&0x1u); *intr_sum=(u16)(ret>>16);
+}
+static inline void decode_sensor_return(u32 ret, u8 *s1, u8 *s2, u8 *sum){
+  *s2=(u8)(ret&0xFu); *s1=(u8)((ret>>4)&0xFu); *sum=(u8)((ret>>8)&0xFFu);
+}
+static inline void decode_cam_return(u32 ret, u16 *sum, u8 *last){
+  *sum=(u16)(ret&0xFFFFu); *last=(u8)((ret>>16)&0xFFu);
+}
+
+/* ---- tiny PRNG + 3/4-loop intruder scheduler ----
+ * PRNG = xorshift32 (pseudo-random generator).
+ * We re-pick 3 or 4 after each injection.
+ */
+static inline u32 rng32(void){
+  static u32 s = 0x9E3779B9u;
+  s ^= (s<<13); s ^= (s>>17); s ^= (s<<5);
+  return s;
+}
+static int cycles_to_intr = 0;
+
+/* ---------------- Init + soft resets ---------------- */
+static int init_all(void){
+  int s = XGpio_Initialize(&GpioLeds, LEDS_GPIO_DEVICE_ID);
+  if(s!=XST_SUCCESS) return s;
+  XGpio_SetDataDirection(&GpioLeds, 1, 0x00);
+  XGpio_DiscreteWrite(&GpioLeds, 1, 0x00);
+
+  if(XAlarm_ip_Initialize(&IpAlarm, ALARM_IP_DEVICE_ID)!=XST_SUCCESS) return XST_FAILURE;
+  if(XSensor_rng_Initialize(&IpSensor, SENSOR_RNG_DEVICE_ID)!=XST_SUCCESS) return XST_FAILURE;
+  if(XCam81_sum_Initialize(&IpCam, CAM81_SUM_DEVICE_ID)!=XST_SUCCESS) return XST_FAILURE;
+  if(XThresh_compare_Initialize(&IpThresh, THRESH_CMP_DEVICE_ID)!=XST_SUCCESS) return XST_FAILURE;
+  if(XMmult3x3_Initialize(&IpMmul, MMULT3X3_DEVICE_ID)!=XST_SUCCESS) return XST_FAILURE;
+
+  /* Soft reset internal states via arg 'reset' */
+  XAlarm_ip_Set_reset(&IpAlarm,1);  XAlarm_ip_Set_do_sample(&IpAlarm,0); RunAndWait_alarm(&IpAlarm);  XAlarm_ip_Set_reset(&IpAlarm,0);
+  XSensor_rng_Set_reset(&IpSensor,1); XSensor_rng_Set_step(&IpSensor,0); RunAndWait_sensor(&IpSensor); XSensor_rng_Set_reset(&IpSensor,0);
+  XCam81_sum_Set_reset(&IpCam,1);   XCam81_sum_Set_do_sample(&IpCam,0); RunAndWait_cam(&IpCam);      XCam81_sum_Set_reset(&IpCam,0);
+  XThresh_compare_Set_reset(&IpThresh,1); RunAndWait_thresh(&IpThresh); XThresh_compare_Set_reset(&IpThresh,0);
+  XMmult3x3_Set_reset(&IpMmul,1);   RunAndWait_mmul(&IpMmul);           XMmult3x3_Set_reset(&IpMmul,0);
+
+  return XST_SUCCESS;
+}
+
+/* ---------------- Main ---------------- */
+int main(void){
+  if(init_all()!=XST_SUCCESS){
+    for(;;){ /* init failure -> blink fast */
+      XGpio_DiscreteWrite(&GpioLeds,1,0b1111); usleep(200000);
+      XGpio_DiscreteWrite(&GpioLeds,1,0x00);   usleep(200000);
+    }
+  }
+
+  /* first schedule: 3 or 4 loops from now */
+  cycles_to_intr = 3 + (int)(rng32() & 1u);
+
+  for(;;){
+    /* schedule: inject every 3 or 4 iterations (randomly) */
+    int inject = 0;
+    if(--cycles_to_intr <= 0){ inject = 1; cycles_to_intr = 3 + (int)(rng32() & 1u); }
+
+    /* ===== RUNNING (show long enough) ===== */
+    XGpio_DiscreteWrite(&GpioLeds,1,0b0011);
+    usleep(500000);  /* 500 ms */
+
+    /* --- Standalone alarm_ip --- */
+    XAlarm_ip_Set_enter_pin(&IpAlarm,1);      /* arm / interact */
+    XAlarm_ip_Set_pin_code(&IpAlarm,2);       /* valid PIN: even and <10 */
+    XAlarm_ip_Set_do_sample(&IpAlarm,1);
+    RunAndWait_alarm(&IpAlarm);
+    u32 alarm_ret = XAlarm_ip_Get_return(&IpAlarm);
+    u8  state, alarm_on; u16 intr_sum_hw;
+    decode_alarm_return(alarm_ret,&state,&alarm_on,&intr_sum_hw);
+
+    /* --- Modular path --- */
+    XSensor_rng_Set_step(&IpSensor,1); RunAndWait_sensor(&IpSensor);
+    u32 sensor_ret = XSensor_rng_Get_return(&IpSensor);
+    u8 s1,s2,ssum; decode_sensor_return(sensor_ret,&s1,&s2,&ssum);
+
+    XCam81_sum_Set_do_sample(&IpCam,1); RunAndWait_cam(&IpCam);
+    u32 cam_ret = XCam81_sum_Get_return(&IpCam);
+    u16 cam_sum; u8 cam_last; decode_cam_return(cam_ret,&cam_sum,&cam_last);
+
+    /* Intrusion metric = (S1+S2) * C  */
+    u16 intr_sum_mod = (u16)((u16)ssum * (u16)cam_sum);
+
+    /* ---- TEST INJECTION: force threshold crossing every 3–4 loops ---- */
+    if(inject){ intr_sum_mod = 1900u; }
+
+    /* Compare against threshold block */
+    XThresh_compare_Set_value_r(&IpThresh, (u32)intr_sum_mod);
+    XThresh_compare_Set_thresh(&IpThresh, 1900u);
+    RunAndWait_thresh(&IpThresh);
+    u32 thr_ret = XThresh_compare_Get_return(&IpThresh);
+    u8 ge = (u8)(thr_ret & 1u);               /* ge==1 ⇔ intr_sum_mod ≥ 1900 */
+
+    /* ===== DONE (show long enough) ===== */
+    XGpio_DiscreteWrite(&GpioLeds,1,0b0101);
+    usleep(500000);  /* 500 ms */
+
+    /* ----- VERIFY (skip on injected loops) ----- */
+    int pass = 1;
+    if(!inject){
+      if(intr_sum_mod != intr_sum_hw) pass = 0;
+      if(ge != (intr_sum_mod >= 1900u)) pass = 0;
+      if(ge && !(state==2u || alarm_on==1u)) pass = 0;  /* expect Alarmed */
+    }
+
+    /* ===== RESULT + VISUAL FEEDBACK ===== */
+    if(ge){                                     /* INTRUDER: sum >= 1900 */
+      XGpio_DiscreteWrite(&GpioLeds,1,0b1110);  /* intruder pattern */
+      usleep(1000000);                          /* hold 1 s */
+    }else{
+      XGpio_DiscreteWrite(&GpioLeds,1,0b0001);  /* safe ping */
+      usleep(250000);
+    }
+
+    if(pass){
+      XGpio_DiscreteWrite(&GpioLeds,1,0b1001);  /* success check */
+      usleep(800000);
+    }else{
+      for(int i=0;i<6;i++){                     /* failure blink */
+        XGpio_DiscreteWrite(&GpioLeds,1,0b1111); usleep(200000);
+        XGpio_DiscreteWrite(&GpioLeds,1,0x00);   usleep(200000);
+      }
+    }
+
+    /* small pause */
+    usleep(300000);
+  }
+}
