@@ -1,0 +1,86 @@
+// File: alarm_ip.c  — single IP for the project (CPU feeds data)
+// All ports are AXI4-Lite 32-bit. Return packs status like before.
+//
+// Rule: I_m = (S1+S2) * sum(C[81]); alarm if I_m >= threshold (default 1900).
+
+enum { INACTIVE = 0, ACTIVE = 1, ALARMED = 2 };
+
+unsigned int alarm_ip(
+    volatile unsigned int C[81],  // 81 regs; CPU writes 0..9 in low byte
+    unsigned int S1,              // CPU writes 0..5
+    unsigned int S2,              // CPU writes 0..5
+    unsigned int threshold,       // CPU sets (0 → use 1900)
+    unsigned int enter_pin,       // button: 1 when pressed
+    unsigned int pin_code,        // any even value = valid PIN
+    unsigned int do_sample,       // 1 = run one measurement
+    unsigned int reset            // 1 = clear IP state and outputs
+) {
+#pragma HLS INTERFACE s_axilite port=C          bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=S1         bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=S2         bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=threshold  bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=enter_pin  bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=pin_code   bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=do_sample  bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=reset      bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=return     bundle=CTRL
+
+    // ---- persistent state (kept across calls) ----
+    static unsigned char state    = INACTIVE;
+    static unsigned char alarm_on = 0;
+    static unsigned int  alarm_ms = 0;   // counts in 120 ms steps, up to 10 s
+
+    // ---- quick masks/clamps to keep inputs in legal ranges ----
+    unsigned int thr = (threshold == 0u) ? 1900u : threshold;
+    unsigned int s1  = (S1 & 0xFFu);  if (s1 > 5u)  s1 = 5u;
+    unsigned int s2  = (S2 & 0xFFu);  if (s2 > 5u)  s2 = 5u;
+    unsigned int pin_ok = (((pin_code & 0xFFu) & 1u) == 0u); // even → valid
+    unsigned int enter  = (enter_pin & 1u);
+    unsigned int sample = (do_sample & 1u);
+
+    if (reset & 1u) {
+        state = INACTIVE; alarm_on = 0; alarm_ms = 0;
+        return 0u;
+    }
+
+    // ---- arming/disarming with PIN ----
+    if (enter && pin_ok) {
+        if (state == INACTIVE)            state = ACTIVE;
+        else if (state == ALARMED) { state = ACTIVE; alarm_on = 0; alarm_ms = 0; }
+    }
+
+    // ---- compute intrusion only when asked ----
+    unsigned int intr_sum = 0u;  // (S1+S2)*sum(C)
+    if (sample) {
+        if (state == ACTIVE) {
+            unsigned int sumC = 0u;
+            int k;
+        LOOP_PIXELS:
+            for (k = 0; k < 81; ++k) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=81 max=81 avg=81
+                unsigned int c = C[k] & 0xFFu;   // use low byte
+                if (c > 9u) c = 9u;              // clamp to 0..9
+                sumC += c;                       // 0..729
+            }
+            intr_sum = (s1 + s2) * sumC;         // 0..7290 (fits 16 bits)
+
+            if (intr_sum >= thr) {               // trigger
+                state = ALARMED;
+                alarm_on = 1;
+                alarm_ms = 0;
+            }
+        }
+
+        // alarm auto-off after ~10 s (120 ms per camera period)
+        if (state == ALARMED) {
+            if (alarm_ms < 10000u) {
+                alarm_ms += 120u;
+                if (alarm_ms >= 10000u) { state = ACTIVE; alarm_on = 0; alarm_ms = 0; }
+            }
+        }
+    }
+
+    // Return: [31:16]=intr_sum, [2]=alarm_on, [1:0]=state
+    return ((intr_sum & 0xFFFFu) << 16) | ((alarm_on & 1u) << 2) | (state & 3u);
+}
