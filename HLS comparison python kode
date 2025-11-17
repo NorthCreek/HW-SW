@@ -1,0 +1,55 @@
+# ------------------------------------------------------------
+# Linear Algebra–Style Dual-Axis Graph for HLS Results
+# ------------------------------------------------------------
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# --- Data setup ---
+data = {
+    "Version": ["Default rolled", "Unrolled", "Default pipelined rolled"],
+    "Latency (cycles)": [250, 134, 90],
+    "Time (ns)": [1250, 670, 450],
+    "FF": [693, 796, 690],
+    "LUT": [1325, 1714, 1344],
+}
+df = pd.DataFrame(data)
+x = np.arange(len(df["Version"]))
+
+# --- Plot ---
+fig, ax1 = plt.subplots(figsize=(9, 6))
+
+# Left axis: performance metrics
+ax1.plot(x, df["Latency (cycles)"], "-o", color="#007acc", label="Latency (cycles)", linewidth=2, markersize=6)
+ax1.plot(x, df["Time (ns)"], "-s", color="#00a65a", label="Time (ns)", linewidth=2, markersize=6)
+ax1.set_ylabel("Performance Metrics", fontsize=12)
+ax1.set_xlabel("Implementation Version", fontsize=12)
+ax1.set_xticks(x)
+ax1.set_xticklabels(df["Version"], rotation=15, ha="right")
+ax1.grid(True, linestyle="--", alpha=0.5)
+
+# Right axis: hardware resource metrics
+ax2 = ax1.twinx()
+ax2.plot(x, df["FF"], "--o", color="#ff9933", label="FF", linewidth=2, markersize=6)
+ax2.plot(x, df["LUT"], "--s", color="#cc3333", label="LUT", linewidth=2, markersize=6)
+ax2.set_ylabel("Hardware Resources (FF / LUT)", fontsize=12)
+
+# Combine legends from both axes
+lines, labels = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines + lines2, labels + labels2, loc="upper right", fontsize=10, frameon=False)
+
+# --- Style tweaks for “linear algebra” look ---
+ax1.spines["top"].set_visible(False)
+ax2.spines["top"].set_visible(False)
+ax1.set_title(
+    r"Comparison of HLS Implementations: $\mathbf{Performance}$ vs $\mathbf{Resources}$",
+    fontsize=14, fontweight="bold", pad=12,
+)
+
+plt.tight_layout()
+
+# --- Save output ---
+out_path = "HLS_LinearStyle_Graph.png"
+plt.savefig(out_path, dpi=250, bbox_inches="tight")
+plt.show()
